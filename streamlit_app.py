@@ -247,6 +247,66 @@ st.title("Student Data Explorer")
 
 
 # ---------------------------------------------------------
+# DATABASE SELECTION
+# ---------------------------------------------------------
+
+with st.sidebar:
+
+    if "database_path" not in st.session_state:
+        st.session_state["database_path"] = "Sqlite3 - Copy.db"
+
+    database_path = "Sqlite3 - Copy.db"
+
+    try:
+        resolved_path = str(path.resolve())
+        modified_time = path.stat().st_mtime
+        tables = list_tables(resolved_path, modified_time)
+    except (sqlite3.Error, OSError) as error:
+        st.error(f"Could not open the database: {error}")
+        st.stop()
+
+    if not tables:
+        st.error("No tables were found in this database.")
+        st.stop()
+
+    selected_tables = st.multiselect(
+        "Database tables",
+        tables,
+        default=tables[:2] if len(tables) >= 2 else tables,
+    )
+
+    if st.button("Refresh database", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    if not selected_tables:
+        st.info("Select at least one database table.")
+        st.stop()
+
+    measure_choices = []
+    for selected_table in selected_tables:
+        table_data = load_table(
+            resolved_path, selected_table, path.stat().st_mtime
+        )
+        detected_measure = find_measure_column(table_data)
+        if detected_measure is None:
+            st.error(
+                f"Could not identify a numeric student-count column in "
+                f"'{selected_table}'."
+            )
+            st.stop()
+
+        measure_options = list(table_data.columns)
+        default_index = measure_options.index(detected_measure)
+        chosen_measure = st.selectbox(
+            f"Student-count column — {selected_table}",
+            measure_options,
+            index=default_index,
+            key=f"measure_{hashlib.md5(selected_table.encode()).hexdigest()[:8]}",
+        )
+        measure_choices.append((selected_table, chosen_measure))
+
+# ---------------------------------------------------------
 # LOAD AND PREPARE SELECTED TABLES
 # ---------------------------------------------------------
 
