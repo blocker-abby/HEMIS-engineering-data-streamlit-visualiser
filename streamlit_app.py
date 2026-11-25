@@ -2,6 +2,7 @@ import sqlite3
 import os
 import hashlib
 import time
+from contextlib import closing
 from pathlib import Path
 
 import pandas as pd
@@ -27,7 +28,6 @@ MEASURE_NAMES = {
     "enrolments", "enrolment", "enrollment", "enrollments",
     "number of enrolments", "number of enrollments", "count",
 }
-VALUE_COLUMN = "_students_numeric"
 SOURCE_COLUMN = "_source_table"
 
 
@@ -36,6 +36,7 @@ SOURCE_COLUMN = "_source_table"
 # ---------------------------------------------------------
 
 def quote_identifier(name):
+    """Safely quote a SQLite table or column identifier."""
     return '"' + str(name).replace('"', '""') + '"'
 
 
@@ -53,10 +54,23 @@ def find_actual_column(columns, requested_name):
     return None
 
 
-@st.cache_data(show_spinner="Reading database tables...")
+def database_connection(database_path):
+    """
+    Open the deployed database read-only. mode=ro prevents SQLite from
+    silently creating an empty database if the path is wrong.
+    """
+    uri = Path(database_path).resolve().as_uri() + "?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=30)
+    connection.execute("PRAGMA query_only = ON")
+    connection.execute("PRAGMA temp_store = FILE")
+    connection.execute("PRAGMA cache_size = -10000")  # approximately 10 MB
+    return connection
+
+
+@st.cache_data(show_spinner="Reading database tables...", max_entries=4)
 def list_tables(database_path, modified_time):
     del modified_time
-    with sqlite3.connect(database_path) as connection:
+    with closing(database_connection(database_path)) as connection:
         rows = connection.execute("""
             SELECT name
             FROM sqlite_master
@@ -67,27 +81,168 @@ def list_tables(database_path, modified_time):
     return [row[0] for row in rows]
 
 
-@st.cache_data(show_spinner="Loading database table...")
-def load_table(database_path, table_name, modified_time):
+@st.cache_data(show_spinner="Reading database structure...")
+def get_table_columns(database_path, table_name, modified_time):
     del modified_time
-    with sqlite3.connect(database_path) as connection:
-        return pd.read_sql_query(
-            f"SELECT * FROM {quote_identifier(table_name)}",
-            connection,
+    with closing(database_connection(database_path)) as connection:
+        rows = connection.execute(
+            f"PRAGMA table_info({quote_identifier(table_name)})"
+        ).fetchall()
+    # PRAGMA table_info: cid, name, type, notnull, default, pk
+    return [(row[1], row[2] or "") for row in rows]
+
+
+def find_measure_column_from_schema(database_path, table_name, columns):
+    """
+    Prefer recognised measure names. Otherwise inspect SQLite's stored type
+    for the first non-null value, avoiding a full-table Pandas load.
+    """
+    names = [name for name, _declared_type in columns]
+    candidates = [
+        name for name in names if normalize_name(name) in MEASURE_NAMES
+    ]
+    if candidates:
+        return candidates[0]
+
+    with closing(database_connection(database_path)) as connection:
+        for name in names:
+            row = connection.execute(
+                f"""
+                SELECT typeof({quote_identifier(name)})
+                FROM {quote_identifier(table_name)}
+                WHERE {quote_identifier(name)} IS NOT NULL
+                LIMIT 1
+                """
+            ).fetchone()
+            if row and row[0] in ("integer", "real"):
+                return name
+
+    return None
+
+
+def is_aggregate_sql(column_names):
+    """
+    SQL equivalent of the original pandas All/Total exclusion.
+    Returns a predicate covering every available dimension in a table.
+    """
+    checks = [
+        f"COALESCE(lower(trim(CAST({quote_identifier(name)} AS TEXT))), '') IN ('all', 'total')"
+        for name in column_names
+    ]
+    return "(" + " OR ".join(checks) + ")" if checks else "0"
+
+
+@st.cache_data(show_spinner="Inspecting database tables...", max_entries=8)
+def build_table_metadata(database_path, table_names, modified_time):
+    """
+    Inspect schemas and count rows without transferring source tables into
+    Pandas. Only compact metadata is returned to the Streamlit process.
+    """
+    metadata = {}
+    common_dimensions = set(DIMENSIONS)
+
+    with closing(database_connection(database_path)) as connection:
+        for table_name in table_names:
+            column_info = get_table_columns(
+                database_path, table_name, modified_time
+            )
+            columns = [name for name, _declared_type in column_info]
+            dimension_map = {
+                dimension: find_actual_column(columns, dimension)
+                for dimension in DIMENSIONS
+            }
+
+            common_dimensions &= {
+                dimension for dimension, actual in dimension_map.items()
+                if actual is not None
+            }
+
+            aggregate_columns = [
+                actual for actual in dimension_map.values()
+                if actual is not None
+            ]
+            aggregate_predicate = is_aggregate_sql(aggregate_columns)
+            original, removed = connection.execute(
+                f"""
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN {aggregate_predicate}
+                                      THEN 1 ELSE 0 END), 0)
+                FROM {quote_identifier(table_name)}
+                """
+            ).fetchone()
+
+            metadata[table_name] = {
+                "columns": columns,
+                "dimension_map": dimension_map,
+                "measure": find_measure_column_from_schema(
+                    database_path, table_name, column_info
+                ),
+                "original": int(original),
+                "removed": int(removed),
+                "rows": int(original - removed),
+            }
+
+    return metadata, sorted(common_dimensions)
+
+
+def build_union_sql(table_names, metadata, measure_choices):
+    """
+    Build a UNION ALL over the selected source tables. Only the requested
+    dimensions, selected measure and source-table label are projected.
+    Aggregate All/Total rows are excluded inside SQLite.
+    """
+    selects = []
+    params = []
+
+    chosen_measures = dict(measure_choices)
+
+    for table_name in table_names:
+        info = metadata[table_name]
+        dimension_map = info["dimension_map"]
+
+        select_columns = []
+        for dimension in DIMENSIONS:
+            actual = dimension_map[dimension]
+            if actual is None:
+                select_columns.append(f"'{ '(Not available)' }' AS {quote_identifier(dimension)}")
+            else:
+                select_columns.append(
+                    f"{quote_identifier(actual)} AS {quote_identifier(dimension)}"
+                )
+
+        measure_column = chosen_measures[table_name]
+        select_columns.append(
+            f"{quote_identifier(measure_column)} AS _raw_measure"
         )
+        select_columns.append("? AS {source}".format(source=quote_identifier(SOURCE_COLUMN)))
+
+        aggregate_columns = [
+            actual for actual in dimension_map.values() if actual is not None
+        ]
+        aggregate_predicate = is_aggregate_sql(aggregate_columns)
+
+        selects.append(
+            f"""
+            SELECT {", ".join(select_columns)}
+            FROM {quote_identifier(table_name)}
+            WHERE NOT {aggregate_predicate}
+            """
+        )
+        params.append(table_name)
+
+    return " UNION ALL ".join(selects), params
 
 
-def is_aggregate_value(series):
-    return (
-        series.astype("string")
-        .str.strip()
-        .str.casefold()
-        .isin(["all", "total"])
-    )
+def missing_scalar(value):
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
 
 
 def sort_value(value):
-    if pd.isna(value):
+    if missing_scalar(value):
         return (2, "")
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return (0, float(value))
@@ -95,148 +250,201 @@ def sort_value(value):
 
 
 def display_value(value):
-    return "(Missing)" if pd.isna(value) else str(value)
+    return "(Missing)" if missing_scalar(value) else str(value)
+
+
+@st.cache_data(show_spinner="Loading filter options...", max_entries=12)
+@st.cache_data(show_spinner="Loading filter options...", max_entries=24)
+def get_distinct_filter_values(
+    database_path, table_names, measure_choices, modified_time, dimension
+):
+    """
+    Fetch only distinct filter values, not full table contents.
+    NULL values are retained so users can explicitly include '(Missing)'.
+    """
+    metadata, _ = build_table_metadata(
+        database_path, table_names, modified_time
+    )
+    selects = []
+    for table_name in table_names:
+        info = metadata[table_name]
+        actual = info["dimension_map"][dimension]
+        aggregate_columns = [
+            name for name in info["dimension_map"].values() if name is not None
+        ]
+        predicate = is_aggregate_sql(aggregate_columns)
+        selects.append(
+            f"""
+            SELECT {quote_identifier(actual)} AS value
+            FROM {quote_identifier(table_name)}
+            WHERE NOT {predicate}
+            """
+        )
+
+    query = "SELECT DISTINCT value FROM (" + " UNION ALL ".join(selects) + ")"
+    with closing(database_connection(database_path)) as connection:
+        values = [row[0] for row in connection.execute(query).fetchall()]
+
+    # Deduplicate values across SQLite tables while preserving distinctions
+    # between strings and numeric values.
+    unique = []
+    seen = set()
+    for value in values:
+        key = ("__NULL__",) if value is None else (type(value).__name__, value)
+        try:
+            if key not in seen:
+                seen.add(key)
+                unique.append(value)
+        except TypeError:
+            if value not in unique:
+                unique.append(value)
+
+    return sorted(unique, key=sort_value)
+
+
+def register_numeric_function(connection):
+    """Convert values such as '1,234' to numbers; invalid values become NULL."""
+    def try_numeric(value):
+        if value is None:
+            return None
+        try:
+            text = str(value).strip().replace(",", "")
+            if not text:
+                return None
+            number = float(text)
+            if number != number or number in (float("inf"), float("-inf")):
+                return None
+            return number
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    connection.create_function("TRY_NUMERIC", 1, try_numeric, deterministic=True)
+
+
+def make_filter_predicate(selected_values_by_dimension):
+    conditions = []
+    params = []
+
+    for dimension, selected_values in selected_values_by_dimension.items():
+        non_missing = [value for value in selected_values if not missing_scalar(value)]
+        include_missing = any(missing_scalar(value) for value in selected_values)
+
+        parts = []
+        if non_missing:
+            placeholders = ",".join("?" for _ in non_missing)
+            parts.append(f"{quote_identifier(dimension)} IN ({placeholders})")
+            params.extend(non_missing)
+        if include_missing:
+            parts.append(f"{quote_identifier(dimension)} IS NULL")
+
+        if not parts:
+            conditions.append("0")
+        else:
+            conditions.append("(" + " OR ".join(parts) + ")")
+
+    return (" AND ".join(conditions) if conditions else "1"), params
+
+
+@st.cache_data(show_spinner="Applying filters and aggregating...", max_entries=24)
+def filter_and_aggregate_sql(
+    database_path,
+    table_names,
+    measure_choices,
+    selected_values_by_dimension,
+    group_columns,
+    modified_time,
+):
+    """
+    Perform filtering, numeric conversion, row counting and GROUP BY in
+    SQLite. Pandas receives only the aggregated result.
+    """
+    metadata, _ = build_table_metadata(
+        database_path, table_names, modified_time
+    )
+    union_sql, union_params = build_union_sql(
+        table_names, metadata, measure_choices
+    )
+    filter_sql, filter_params = make_filter_predicate(
+        selected_values_by_dimension
+    )
+
+    group_sql = ", ".join(quote_identifier(column) for column in group_columns)
+
+    # MATERIALIZED lets the filtered rows be reused by the metrics and
+    # aggregation subqueries without loading them into Python memory.
+    query = f"""
+        WITH combined AS (
+            {union_sql}
+        ),
+        filtered AS MATERIALIZED (
+            SELECT *,
+                   TRY_NUMERIC(_raw_measure) AS _numeric_measure
+            FROM combined
+            WHERE {filter_sql}
+        ),
+        stats AS (
+            SELECT
+                COUNT(_numeric_measure) AS valid_rows,
+                COALESCE(SUM(_numeric_measure), 0) AS total_students,
+                COUNT(*) - COUNT(_numeric_measure) AS invalid_rows
+            FROM filtered
+        ),
+        aggregated AS (
+            SELECT
+                {group_sql},
+                SUM(_numeric_measure) AS students
+            FROM filtered
+            WHERE _numeric_measure IS NOT NULL
+            GROUP BY {group_sql}
+        )
+        SELECT aggregated.*, stats.valid_rows, stats.total_students,
+               stats.invalid_rows
+        FROM stats
+        LEFT JOIN aggregated ON 1 = 1
+    """
+
+    with closing(database_connection(database_path)) as connection:
+        register_numeric_function(connection)
+        rows = connection.execute(
+            query, union_params + filter_params
+        ).fetchall()
+
+    # The result schema is predictable: group columns, students, then metrics.
+    result_columns = (
+        list(group_columns)
+        + ["students", "_valid_rows", "_total_students", "_invalid_rows"]
+    )
+    result = pd.DataFrame(rows, columns=result_columns)
+
+    if result.empty:
+        return (
+            pd.DataFrame(columns=list(group_columns) + ["students"]),
+            0, 0.0, 0
+        )
+
+    valid_rows = int(result["_valid_rows"].iloc[0] or 0)
+    total_students = float(result["_total_students"].iloc[0] or 0)
+    invalid_rows = int(result["_invalid_rows"].iloc[0] or 0)
+
+    if valid_rows == 0:
+        aggregated = pd.DataFrame(columns=list(group_columns) + ["students"])
+    else:
+        aggregated = result.loc[
+            result["students"].notna(), list(group_columns) + ["students"]
+        ].copy()
+
+    for column in group_columns:
+        if column in aggregated.columns:
+            aggregated[column] = aggregated[column].where(
+                aggregated[column].notna(), "(Missing)"
+            )
+
+    return aggregated, valid_rows, total_students, invalid_rows
 
 
 def set_filter_checkbox_values(keys, checked):
     for key in keys:
         st.session_state[key] = checked
-
-
-def find_measure_column(data):
-    candidates = [
-        column for column in data.columns
-        if normalize_name(column) in MEASURE_NAMES
-    ]
-    if candidates:
-        return candidates[0]
-
-    numeric_columns = [
-        column for column in data.columns
-        if pd.api.types.is_numeric_dtype(data[column])
-    ]
-    return numeric_columns[0] if numeric_columns else None
-
-
-@st.cache_data(show_spinner="Preparing student data...", max_entries=16)
-def prepare_selected_tables(database_path, table_names, modified_time, measure_choices):
-    frames = []
-    table_stats = {}
-    common_dimensions = set(DIMENSIONS)
-
-    for table_name in table_names:
-        data = load_table(database_path, table_name, modified_time).copy()
-        if data.empty:
-            table_stats[table_name] = {
-                "original": 0, "removed": 0, "invalid": 0,
-                "measure": None, "rows": 0,
-            }
-            continue
-
-        dimension_map = {
-            dimension: find_actual_column(data.columns, dimension)
-            for dimension in DIMENSIONS
-        }
-        common_dimensions &= {
-            dimension for dimension, actual in dimension_map.items()
-            if actual is not None
-        }
-
-        aggregate_mask = pd.Series(False, index=data.index)
-        for actual_column in dimension_map.values():
-            if actual_column is not None:
-                aggregate_mask |= is_aggregate_value(data[actual_column])
-
-        original_count = len(data)
-        data = data.loc[~aggregate_mask].copy()
-        removed_count = original_count - len(data)
-
-        measure_column = dict(measure_choices).get(table_name)
-        if measure_column not in data.columns:
-            raise ValueError(
-                f"Could not identify a numeric student-count column in table "
-                f"'{table_name}'. Columns found: {list(data.columns)}"
-            )
-
-        data[VALUE_COLUMN] = pd.to_numeric(
-            data[measure_column]
-            .astype("string")
-            .str.replace(",", "", regex=False),
-            errors="coerce",
-        )
-
-        # Standardise dimension names so the selected tables can be combined.
-        standardised = pd.DataFrame(index=data.index)
-        for dimension in DIMENSIONS:
-            actual = dimension_map[dimension]
-            if actual is None:
-                standardised[dimension] = "(Not available)"
-            else:
-                standardised[dimension] = data[actual]
-
-        standardised[VALUE_COLUMN] = data[VALUE_COLUMN]
-        standardised[SOURCE_COLUMN] = table_name
-        frames.append(standardised)
-
-        table_stats[table_name] = {
-            "original": original_count,
-            "removed": removed_count,
-            "invalid": int(data[VALUE_COLUMN].isna().sum()),
-            "measure": measure_column,
-            "rows": len(data),
-        }
-
-    if not frames:
-        return pd.DataFrame(columns=DIMENSIONS + [VALUE_COLUMN, SOURCE_COLUMN]), table_stats, []
-
-    combined = pd.concat(frames, ignore_index=True)
-    return combined, table_stats, sorted(common_dimensions)
-
-
-@st.cache_data(show_spinner="Applying filters and aggregating...", max_entries=32)
-def filter_and_aggregate(
-    combined_data,
-    selected_values_by_dimension,
-    group_columns,
-):
-    data = combined_data
-    combined_mask = pd.Series(True, index=data.index)
-
-    for dimension, selected_values in selected_values_by_dimension.items():
-        non_missing = [value for value in selected_values if not pd.isna(value)]
-        include_missing = any(pd.isna(value) for value in selected_values)
-
-        dimension_mask = data[dimension].isin(non_missing)
-        if include_missing:
-            dimension_mask |= data[dimension].isna()
-        combined_mask &= dimension_mask
-
-    filtered = data.loc[combined_mask]
-    invalid_count = int(filtered[VALUE_COLUMN].isna().sum())
-    valid = filtered.dropna(subset=[VALUE_COLUMN])
-
-    if valid.empty:
-        return pd.DataFrame(columns=list(group_columns) + ["students"]), 0, 0.0, invalid_count
-
-    aggregated = (
-        valid.groupby(list(group_columns), dropna=False, as_index=False)[VALUE_COLUMN]
-        .sum()
-        .rename(columns={VALUE_COLUMN: "students"})
-    )
-
-    for column in group_columns:
-        aggregated[column] = (
-            aggregated[column]
-            .astype("object")
-            .where(aggregated[column].notna(), "(Missing)")
-        )
-
-    return (
-        aggregated,
-        int(len(valid)),
-        float(valid[VALUE_COLUMN].sum()),
-        invalid_count,
-    )
 
 
 # ---------------------------------------------------------
@@ -247,11 +455,10 @@ st.title("Student Data Explorer")
 
 
 # ---------------------------------------------------------
-# DATABASE SELECTION
+# DATABASE CONFIGURATION
 # ---------------------------------------------------------
 
 with st.sidebar:
-
     if "database_path" not in st.session_state:
         st.session_state["database_path"] = "Sqlite3 - Copy.db"
 
@@ -260,6 +467,10 @@ with st.sidebar:
 
     try:
         resolved_path = str(path.resolve())
+        if not path.is_file():
+            st.error(f"Database file not found: {resolved_path}")
+            st.stop()
+
         modified_time = path.stat().st_mtime
         tables = list_tables(resolved_path, modified_time)
     except (sqlite3.Error, OSError) as error:
@@ -284,20 +495,26 @@ with st.sidebar:
         st.info("Select at least one database table.")
         st.stop()
 
+    try:
+        table_metadata, common_dimensions = build_table_metadata(
+            resolved_path, tuple(selected_tables), modified_time
+        )
+    except (sqlite3.Error, OSError, KeyError, ValueError) as error:
+        st.error(f"Could not inspect database tables: {error}")
+        st.stop()
+
     measure_choices = []
     for selected_table in selected_tables:
-        table_data = load_table(
-            resolved_path, selected_table, path.stat().st_mtime
-        )
-        detected_measure = find_measure_column(table_data)
-        if detected_measure is None:
+        measure_options = table_metadata[selected_table]["columns"]
+        detected_measure = table_metadata[selected_table]["measure"]
+
+        if not measure_options or detected_measure is None:
             st.error(
                 f"Could not identify a numeric student-count column in "
                 f"'{selected_table}'."
             )
             st.stop()
 
-        measure_options = list(table_data.columns)
         default_index = measure_options.index(detected_measure)
         chosen_measure = st.selectbox(
             f"Student-count column — {selected_table}",
@@ -307,27 +524,10 @@ with st.sidebar:
         )
         measure_choices.append((selected_table, chosen_measure))
 
+
 # ---------------------------------------------------------
-# LOAD AND PREPARE SELECTED TABLES
+# VALIDATE SELECTED TABLES AND DIMENSIONS
 # ---------------------------------------------------------
-
-database_load_start = time.perf_counter()
-try:
-    combined_df, table_stats, common_dimensions = prepare_selected_tables(
-        resolved_path,
-        tuple(selected_tables),
-        path.stat().st_mtime,
-        tuple(measure_choices),
-    )
-except (sqlite3.Error, OSError, pd.errors.DatabaseError, KeyError, ValueError, TypeError) as error:
-    st.error(f"Could not prepare the selected tables: {error}")
-    st.stop()
-
-database_load_seconds = time.perf_counter() - database_load_start
-
-if combined_df.empty:
-    st.warning("The selected tables contain no rows.")
-    st.stop()
 
 if not common_dimensions:
     st.error(
@@ -335,6 +535,16 @@ if not common_dimensions:
         "(year, cesm, institute, degree, race, gender)."
     )
     st.stop()
+
+table_stats = {
+    table_name: {
+        "original": table_metadata[table_name]["original"],
+        "removed": table_metadata[table_name]["removed"],
+        "rows": table_metadata[table_name]["rows"],
+        "measure": dict(measure_choices)[table_name],
+    }
+    for table_name in selected_tables
+}
 
 
 # ---------------------------------------------------------
@@ -410,13 +620,30 @@ applied_filters_key = f"applied_filters_{filter_scope}"
 
 selected_values_by_dimension = {}
 
+distinct_values_by_dimension = {}
+distinct_start = time.perf_counter()
+
+try:
+    for dimension in common_dimensions:
+        distinct_values_by_dimension[dimension] = get_distinct_filter_values(
+            resolved_path,
+            tuple(selected_tables),
+            tuple(measure_choices),
+            modified_time,
+            dimension,
+        )
+except (sqlite3.Error, OSError, KeyError, ValueError) as error:
+    st.error(f"Could not retrieve filter values from SQLite: {error}")
+    st.stop()
+
+distinct_values_seconds = time.perf_counter() - distinct_start
+
 with st.form(key=f"filters_form_{filter_scope}"):
     pending_values_by_dimension = {}
     filter_tabs = st.tabs(common_dimensions)
 
     for dimension, tab in zip(common_dimensions, filter_tabs):
-        distinct_values = combined_df[dimension].drop_duplicates().tolist()
-        distinct_values = sorted(distinct_values, key=sort_value)
+        distinct_values = distinct_values_by_dimension[dimension]
 
         checkbox_keys = [
             f"include_{filter_scope}_{dimension}_{i}"
@@ -500,7 +727,7 @@ if empty_dimensions:
 
 
 # ---------------------------------------------------------
-# FILTER AND AGGREGATE
+# FILTER AND AGGREGATE IN SQLITE
 # ---------------------------------------------------------
 
 x_column = x_dimension
@@ -516,15 +743,31 @@ if series_column and series_column != x_column:
     group_columns.append(series_column)
 
 group_start = time.perf_counter()
-aggregated, filtered_row_count, total_students, invalid_measure_rows = filter_and_aggregate(
-    combined_df,
-    selected_values_by_dimension,
-    tuple(group_columns),
-)
+try:
+    aggregated, filtered_row_count, total_students, invalid_measure_rows = (
+        filter_and_aggregate_sql(
+            resolved_path,
+            tuple(selected_tables),
+            tuple(measure_choices),
+            selected_values_by_dimension,
+            tuple(group_columns),
+            modified_time,
+        )
+    )
+except (sqlite3.Error, OSError, KeyError, ValueError, TypeError) as error:
+    st.error(f"Could not filter and aggregate the database: {error}")
+    st.stop()
+
 filter_aggregation_seconds = time.perf_counter() - group_start
 
 if aggregated.empty:
-    st.warning("No numeric student values match the selected filter values.")
+    if invalid_measure_rows:
+        st.warning(
+            "The selected filters match rows, but their student-count values "
+            "are all missing or non-numeric."
+        )
+    else:
+        st.warning("No numeric student values match the selected filter values.")
     st.stop()
 
 
@@ -704,8 +947,9 @@ with st.expander("View aggregated data"):
 if show_performance:
     with st.expander("Performance timings", expanded=True):
         st.write({
-            "SQLite table load and preparation": round(database_load_seconds, 3),
-            "Filtering and aggregation": round(filter_aggregation_seconds, 3),
+            "SQLite schema inspection and row counts": "cached/metadata only",
+            "Distinct filter values": round(distinct_values_seconds, 3),
+            "SQLite filtering and aggregation": round(filter_aggregation_seconds, 3),
             "Plotly figure construction": round(chart_build_seconds, 3),
             "Chart rendering call (server-side)": round(render_seconds, 3),
             "Total app execution": round(time.perf_counter() - app_start_time, 3),
