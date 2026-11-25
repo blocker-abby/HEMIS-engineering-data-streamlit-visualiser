@@ -256,7 +256,7 @@ with st.sidebar:
         st.session_state["database_path"] = "Sqlite3 - Copy.db"
 
     database_path = "Sqlite3 - Copy.db"
-    path = database_path
+    path = Path(database_path).expanduser()
 
     try:
         resolved_path = str(path.resolve())
